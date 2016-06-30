@@ -89,74 +89,96 @@ func (c *Cache) Clear() {
 // Secret retrieves a Secret by name from cache or a server.
 //
 // Cache logic:
-//  1. Check cache for secret.
-//			* If entry is fresh, return cache entry.
-//			* If entry is not fresh, call backend.
-//  2. Ask backend for secret (with timeout).
-//			* If backend returns success: update cache, return.
-//			* If backend returns deleted: set delayed deletion, return data from cache.
-//  3. If timeout backend deadline hit return whatever we have.
+//  * If cache hit and very recent: return cache entry
+//  * Ask backend w/ timeout
+//  * If backend returns fast: update cache, return
+//  * If backend returns deleted: set delayed deletion, return data from cache
+//  * If timeout_backend_deadline AND cache hit: return cache entry, background update cache when
+//    backend returns
+//  * If timeout_max_wait: log error and pretend file doesn't exist
 func (c *Cache) Secret(name string) (*Secret, bool) {
-	// Perform cache lookup first
-	cacheResult := c.cacheSecret(name)
+	failureDeadline := time.After(c.timeouts.MaxWait)
+	var backendDeadline <-chan time.Time // inactive, until backend request starts
 
-	var secret *Secret
-	var success bool
-
-	if cacheResult != nil {
-		secret = &cacheResult.Secret
-		success = true
+	var cachedSecret *Secret
+	resultFromCache := func() (*Secret, bool) {
+		success := cachedSecret != nil
+		return cachedSecret, success
 	}
 
-	// If cache succeeded, and entry is very recent, return cache result
-	if success && (time.Since(cacheResult.Time) < c.timeouts.Fresh) {
-		return &cacheResult.Secret, success
-	}
+	cacheDone := c.cacheSecret(name)
+	var backendDone chan secretResult
 
-	backendDeadline := time.After(c.timeouts.BackendDeadline)
-	backendDone := c.backendSecret(name)
+	for {
+		select {
+		case s := <-backendDone:
+			backendDone = nil
+			if s.err == nil {
+				// Always return successful value from backend
+				return s.secret, true
+			}
+			if _, ok := s.err.(SecretDeleted); ok {
+				c.secretMap.Delete(name)
+			}
+			// Backend failed and cache lookup already finished
+			if cacheDone == nil {
+				return resultFromCache()
+			}
+		case s := <-cacheDone:
+			cacheDone = nil
+			if s != nil {
+				cachedSecret = &s.Secret
 
-	select {
-	case s := <-backendDone:
-		if s.err == nil {
-			secret = s.secret
-			success = true
+				// If cache entry very recent, return cache result
+				if time.Since(s.Time) < c.timeouts.Fresh {
+					return resultFromCache()
+				}
+			}
+
+			// Start backend request and wait until optimistic deadline
+			backendDone = c.backendSecret(name)
+			backendDeadline = time.After(c.timeouts.BackendDeadline)
+		case <-backendDeadline:
+			if cachedSecret != nil {
+				return cachedSecret, true
+			}
+		case <-failureDeadline:
+			c.Errorf("Cache and backend timeout: %v", name)
+			return nil, false
 		}
-		if _, ok := s.err.(SecretDeleted); ok {
-			c.secretMap.Delete(name)
-		}
-	case <-backendDeadline:
-		c.Errorf("Backend timeout on secret fetch for '%s'", name)
 	}
-
-	return secret, success
 }
 
 // SecretList returns a listing of Secrets from cache or a server.
 //
 // Cache logic:
-//  * If backend returns fast: update cache, return.
-//  * If timeout backend deadline: return cache entries, background update cache.
-//  * If timeout max wait: return cache version.
+//  * Ask backend w/ timeout
+//  * If backend returns fast: update cache, return
+//  * If timeout_backend_deadline: return cache entries, background update cache when
+//    backend returns
+//  * If timeout_max_wait: log error and pretend no files
 func (c *Cache) SecretList() []Secret {
-	// Perform cache lookup first
-	var secretList []Secret
-
-	cacheResult := c.cacheSecretList()
-	if cacheResult != nil {
-		secretList = cacheResult
-	}
-
+	failureDeadline := time.After(c.timeouts.MaxWait)
+	// Optimistically wait for a backend response before using a cached response.
 	backendDeadline := time.After(c.timeouts.BackendDeadline)
+
+	cacheDone := c.cacheSecretList()
 	backendDone := c.backendSecretList()
 
+	var cachedSecrets []Secret
 	for {
 		select {
-		case backendResult := <-backendDone:
-			return backendResult
+		case secrets := <-backendDone:
+			return secrets
+		case cachedSecrets = <-cacheDone:
+			cacheDone = nil
 		case <-backendDeadline:
-			c.Errorf("Backend timeout for secret list")
-			return secretList
+			if cachedSecrets != nil {
+				return cachedSecrets
+			}
+		case <-failureDeadline:
+			c.Errorf("Cache and backend timeout: secretList()")
+			return make([]Secret, 0)
 		}
 	}
 }
@@ -174,30 +196,47 @@ func (c *Cache) Len() int {
 }
 
 // cacheSecret retrieves a secret from the cache.
-func (c *Cache) cacheSecret(name string) *SecretTime {
-	secret, ok := c.secretMap.Get(name)
-	if ok && len(secret.Secret.Content) > 0 {
-		c.Debugf("Cache hit: %v", name)
-		return &secret
-	}
-	c.Debugf("Cache miss: %v", name)
-	return nil
+//
+// Cache lookup may block, so retrieval is concurrent and a channel is returned to communicate a
+// successful value. The channel will not be fulfilled on error.
+func (c *Cache) cacheSecret(name string) chan *SecretTime {
+	secretc := make(chan *SecretTime, 1)
+	go func() {
+		defer close(secretc)
+		secret, ok := c.secretMap.Get(name)
+		if ok && len(secret.Secret.Content) > 0 {
+			c.Debugf("Cache hit: %v", name)
+			secretc <- &secret
+		} else {
+			c.Debugf("Cache miss: %v", name)
+			secretc <- nil
+		}
+	}()
+	return secretc
 }
 
 // cacheSecretList retrieves a secret listing from the cache.
-func (c *Cache) cacheSecretList() []Secret {
-	values := c.secretMap.Values()
-	secrets := make([]Secret, len(values))
-	for i, v := range values {
-		secrets[i] = v.Secret
-	}
-	return secrets
+//
+// Cache lookup may block, so retrieval is concurrent and a channel is returned to communicate
+// a cache lookup result.
+func (c *Cache) cacheSecretList() chan []Secret {
+	secretsc := make(chan []Secret, 1)
+	go func() {
+		defer close(secretsc)
+		values := c.secretMap.Values()
+		secrets := make([]Secret, len(values))
+		for i, v := range values {
+			secrets[i] = v.Secret
+		}
+		secretsc <- secrets
+	}()
+	return secretsc
 }
 
 // backendSecret retrieves a secret from the backend and updates the cache.
 //
-// Retrieval is concurrent, so a channel is returned to communicate a successful value.
-// The channel will not be fulfilled on error.
+// Retrieval is concurrent, so a channel is returned to communicate a successful value. The channel
+// will not be fulfilled on error.
 func (c *Cache) backendSecret(name string) chan secretResult {
 	secretc := make(chan secretResult)
 	go func() {
